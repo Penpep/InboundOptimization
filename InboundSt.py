@@ -1,5 +1,6 @@
 import streamlit as st
-st.set_page_config(page_title="Inbound Dock Inventory Analysis", layout='wide')
+st.set_page_config(page_title="Inbound Dock Inventory Analysis", layout='wide',
+    page_icon='smiley')
 
 
 import pandas as pd
@@ -128,6 +129,7 @@ def run_analysis(uploaded_file):
 
 # Streamlit interface
 st.title("Inbound Delivery Planning Tool")
+st.write("Delivery with greatest space utilization will be highlighted")
 
 uploaded_file = st.file_uploader("Upload your BOM Excel file", type=["xlsx", "xlsm"])
 if uploaded_file:
@@ -137,7 +139,26 @@ if uploaded_file:
             df_output = run_analysis(uploaded_file)
 
         st.subheader("Delivery Plan Output")
-        st.dataframe(df_output)
+
+        # Identify delivery columns
+        delivery_headers = df_output.columns[2:]
+
+        # Get the index of the last 4 rows (summary rows)
+        summary_idx = df_output.tail(4).index
+
+        # Convert summary values to numeric for styling
+        df_output.iloc[summary_idx, 2:] = df_output.iloc[summary_idx, 2:].apply(pd.to_numeric, errors='coerce')
+
+        # Function to highlight max values in summary rows
+        def highlight_summary_max(row):
+            if row.name in summary_idx:
+                max_val = row[2:].max()
+                return ['background-color: lightgreen' if v == max_val else '' for v in row]
+            return [''] * len(row)
+
+        styled_df = df_output.style.apply(highlight_summary_max, axis=1).format(precision=0)
+
+        st.dataframe(styled_df)
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
