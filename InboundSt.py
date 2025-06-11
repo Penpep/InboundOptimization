@@ -35,6 +35,7 @@ def generate_deliveries(qty, pack_size, cadence, shft_hrs, cons_rate):
         deliveries.append(0)
     return deliveries
 
+# === Space Analysis =======
 def get_dock_inventory_peaks_per_part(deliveries, pack_size, consumption_rate, shift_hours, max_lineside, min_lineside):
     if not deliveries or pack_size <= 0 or consumption_rate <= 0:
         return [0] * len(deliveries)
@@ -54,25 +55,18 @@ def get_dock_inventory_peaks_per_part(deliveries, pack_size, consumption_rate, s
         else:
             dock_timeline.append(0)
 
-        consumed = consumption_rate * interval
+        consumption = consumption_rate * interval
+        pull_needed = max(consumption - lineside_inventory_units, 0)
+        actual_pull = min(pull_needed, dock_inventory_units)
 
-        # === Pull to lineside if needed ===
-        if lineside_inventory_units < consumed:
-            pull_units = min(consumed - lineside_inventory_units, dock_inventory_units)
-            dock_inventory_units -= pull_units
-            lineside_inventory_units += pull_units
+        # Pull to lineside
+        dock_inventory_units -= actual_pull
+        lineside_inventory_units += actual_pull
 
-        # Probably not needed if measuring peak inventory 
-        # if lineside_inventory_units < min_lineside:
-        #     top_off = min(min_lineside - lineside_inventory_units, dock_inventory_units)
-        #     dock_inventory_units -= top_off
-        #     lineside_inventory_units += top_off
-
-        # === Consume from lineside ===
-        lineside_inventory_units = max(0, lineside_inventory_units - consumed)
+        # 4. Consume from lineside
+        lineside_inventory_units = max(0, lineside_inventory_units - consumption)
 
     return dock_timeline
-
 
 def run_analysis(uploaded_file):
     wb = load_workbook(uploaded_file, data_only=True)
@@ -150,10 +144,13 @@ def run_analysis(uploaded_file):
     for box, pallet in zip(box_sums, pallet_sums):
         percent_box = (box / box_dock_space) * 100 if box_dock_space else 0
         percent_pallet = (pallet / pallet_dock_space) * 100 if pallet_dock_space else 0
+
         lanes_used = math.ceil(pallet/ pallets_per_line) 
         lanes_percent = 100*lanes_used / total_line_side 
+
         utilization_pallet.append(round(percent_pallet, 1))
         utilization_box.append(round(percent_box, 1))
+
         total_lanes_needed.append(lanes_used)
         percent_lanes.append(round(lanes_percent,1))
 
@@ -198,7 +195,7 @@ def run_analysis(uploaded_file):
                 'Part Number': part,
                 'Shift': 1,
                 'Delivery Label': f"Delivery {i+1} (S1 - {time_1[i].strftime('%I:%M %p')})",
-                'Inventory Packages': math.ceil(inv_units / pack_size),
+                'Inventory Packages': inv_units // pack_size,
                 'Package Type': pkg_type
             })
 
@@ -207,7 +204,7 @@ def run_analysis(uploaded_file):
                 'Part Number': part,
                 'Shift': 2,
                 'Delivery Label': f"Delivery {i+1} (S2 - {time_2[i].strftime('%I:%M %p')})",
-                'Inventory Packages': math.ceil(inv_units / pack_size),
+                'Inventory Packages': inv_units // pack_size,
                 'Package Type': pkg_type
             })
 
@@ -268,7 +265,6 @@ def run_analysis(uploaded_file):
 
 # Streamlit interface
 st.title("Inbound Delivery Planning Tool")
-st.write("Delivery with greatest space utilization will be highlighted")
 
 uploaded_file = st.file_uploader("Upload your BOM Excel file", type=["xlsx", "xlsm"])
 if uploaded_file:
@@ -279,25 +275,7 @@ if uploaded_file:
 
         st.subheader("Delivery Plan Output")
 
-        # Identify delivery columns
-        delivery_headers = df_output.columns[2:]
-
-        # Get the index of the last 4 rows (summary rows)
-        summary_idx = df_output.tail(4).index
-
-        # Convert summary values to numeric for styling
-        df_output.iloc[summary_idx, 2:] = df_output.iloc[summary_idx, 2:].apply(pd.to_numeric, errors='coerce')
-
-        # Function to highlight max values in summary rows
-        def highlight_summary_max(row):
-            if row.name in summary_idx:
-                max_val = row[2:].max()
-                return ['background-color: lightgreen' if v == max_val else '' for v in row]
-            return [''] * len(row)
-
-        styled_df = df_output.style.apply(highlight_summary_max, axis=1).format(precision=0)
-
-        st.dataframe(styled_df)
+        st.dataframe(df_output)
         st.subheader("Dock Inventory Space Per Part (Pallet Equivalents)")
         st.dataframe(df_dock_space)
 
