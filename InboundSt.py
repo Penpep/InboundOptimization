@@ -50,10 +50,7 @@ def get_dock_inventory_peaks_per_part(deliveries, pack_size, consumption_rate, s
         dock_inventory_units += delivered_units
 
         # === Record peak BEFORE lineside pull ===
-        if delivered_units > 0:
-            dock_timeline.append(dock_inventory_units)
-        else:
-            dock_timeline.append(0)
+        dock_timeline.append(dock_inventory_units)
 
         consumption = consumption_rate * interval
         pull_needed = max(consumption - lineside_inventory_units, 0)
