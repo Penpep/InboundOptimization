@@ -13,10 +13,14 @@ import tempfile
 
 
 def generate_times(start, end, cadence):
+    if cadence == 0 or cadence is None:
+        return []  # No deliveries
     interval = (end - start) / cadence
     return [start + i * interval for i in range(cadence)]
 
 def generate_deliveries(qty, pack_size, cadence, shft_hrs, cons_rate):
+    if cadence == 0 or cadence is None:
+        return []
     deliveries = []
     interval = shft_hrs / cadence
     total_units_delivered = 0
@@ -35,40 +39,37 @@ def generate_deliveries(qty, pack_size, cadence, shft_hrs, cons_rate):
         deliveries.append(0)
     return deliveries
 
-# === Space Analysis =======
-def get_dock_inventory_peaks_per_part(deliveries, pack_size, consumption_rate, shift_hours, max_lineside, min_lineside):
+def get_dock_inventory_peaks_per_part(deliveries, pack_size, consumption_rate, shift_hours, max_lineside, min_lineside, on_hand):
     if not deliveries or pack_size <= 0 or consumption_rate <= 0:
         return [0] * len(deliveries)
 
     interval = shift_hours / len(deliveries)
-    dock_inventory_units = 0
+    dock_inventory_units = on_hand
     lineside_inventory_units = 0
     dock_timeline = []
 
-    for i, delivery in enumerate(deliveries):
+    for delivery in deliveries:
         delivered_units = delivery * pack_size
         dock_inventory_units += delivered_units
-
-        # === Record peak BEFORE lineside pull ===
-        dock_timeline.append(dock_inventory_units)
+        dock_timeline.append(math.ceil(dock_inventory_units / pack_size))
 
         consumption = consumption_rate * interval
         pull_needed = max(consumption - lineside_inventory_units, 0)
         actual_pull = min(pull_needed, dock_inventory_units)
 
-        # Pull to lineside
         dock_inventory_units -= actual_pull
         lineside_inventory_units += actual_pull
-
-        # 4. Consume from lineside
         lineside_inventory_units = max(0, lineside_inventory_units - consumption)
 
     return dock_timeline
 
-def run_analysis(uploaded_file):
-    wb = load_workbook(uploaded_file, data_only=True)
-    ws = wb['Inbound']
 
+def run_analysis(uploaded_file, input):
+    wb = load_workbook(uploaded_file, data_only=True)
+    sheet_name = f'Inbound-{input}'
+    ws = wb[sheet_name]
+    
+    # Read parameters 
     cadence_shift_1 = ws['B5'].value
     cadence_shift_2 = ws['B13'].value
     rate_per_line = ws['B6'].value
@@ -89,19 +90,16 @@ def run_analysis(uploaded_file):
     time_1 = generate_times(start_shift_1, end_shift_1, cadence_shift_1)
     time_2 = generate_times(start_shift_2, end_shift_2, cadence_shift_2)
 
-    df_bom = pd.read_excel(uploaded_file, sheet_name='Inbound', skiprows=15, header=None)
+    df_bom_sheet = f'Inbound-{input}'
+    df_bom = pd.read_excel(uploaded_file, sheet_name= df_bom_sheet, skiprows=15, header=None)
     df_bom.columns = [
         'Part Number', 'Description', 'Quantity / Unit', 'Needed per day',
         'Quantity Needed for Shift 1', 'Quantity Needed for Shift 2',
         'Pallets Utilized for Shift 1', 'Pallets Utilized for Shift 2',
-        'Pallets Utilized per day', 'Replenishment Frequency',
-        'Max Quantity during Arrival', 'Arrival Rate per X hours',
-        'Departure rate Pallets per hour',
         'Consumption Rate Units/ Hour Shift 1',
         'Consumption Rate / Hour Shift 2', 'Standard Pack Size', 'Package Type',
-        'Boxes to Pallets shift 1', 'Maximum Storage on Lineside',
-        'Minimum Storage on Lineside', 'Helper Column 1', 'Helper Column 2',
-        'Boxes to Pallets shift 2']
+        'Maximum Storage on Lineside', 'Minimum Storage on Lineside', 
+        'On-hand qty', 'QTY vs Shift 1']
 
     columns = ['Part Number', 'Package Type']
     columns += [f"Delivery {i+1} (S1 - {t.strftime('%I:%M %p')})" for i, t in enumerate(time_1)]
@@ -117,9 +115,14 @@ def run_analysis(uploaded_file):
         qty2 = row['Quantity Needed for Shift 2']
         cons_1 = row['Consumption Rate Units/ Hour Shift 1']
         cons_2 = row['Consumption Rate / Hour Shift 2']
+        on_hand = row['On-hand qty'] 
 
-        deliveries_1 = generate_deliveries(qty1, pack_size, cadence_shift_1, shift_1_hours, cons_1)
-        deliveries_2 = generate_deliveries(qty2, pack_size, cadence_shift_2, shift_2_hours, cons_2)
+        net_qty_1 = max(qty1 - on_hand, 0)
+        remaining_on_hand = max(on_hand - qty1, 0)
+        net_qty_2 = max(qty2 - remaining_on_hand, 0)
+
+        deliveries_1 = generate_deliveries(net_qty_1, pack_size, cadence_shift_1, shift_1_hours, cons_1)
+        deliveries_2 = generate_deliveries(net_qty_2, pack_size, cadence_shift_2, shift_2_hours, cons_2)
 
         delivery_plan.append([part, pkg_type] + deliveries_1 + deliveries_2)
 
@@ -168,9 +171,8 @@ def run_analysis(uploaded_file):
         pkg_type = row['Package Type']
         cons_1 = row['Consumption Rate Units/ Hour Shift 1'] * 0.9
         cons_2 = row['Consumption Rate / Hour Shift 2'] * 0.9
-
-        if pd.isna(pack_size) or pack_size <= 0:
-            continue
+        on_hand = row['On-hand qty']
+        remaining_on_hand = max(on_hand - row['Quantity Needed for Shift 1'], 0)
 
         deliveries_1 = df_output.loc[idx, df_output.columns.str.contains(r"S1 -")].tolist()
         deliveries_2 = df_output.loc[idx, df_output.columns.str.contains(r"S2 -")].tolist()
@@ -180,34 +182,17 @@ def run_analysis(uploaded_file):
         max_lineside_2 = lines_shift_2 * row['Maximum Storage on Lineside']
         min_lineside_2 = lines_shift_2 * row['Minimum Storage on Lineside']
 
-        timeline_1 = get_dock_inventory_peaks_per_part(
-            deliveries_1, pack_size, cons_1, shift_1_hours, max_lineside_1, min_lineside_1
-        )
-        timeline_2 = get_dock_inventory_peaks_per_part(
-            deliveries_2, pack_size, cons_2, shift_2_hours, max_lineside_2, min_lineside_2
-        )
+        timeline_1 = get_dock_inventory_peaks_per_part(deliveries_1, pack_size, cons_1, shift_1_hours, max_lineside_1, min_lineside_1, on_hand)
+        timeline_2 = get_dock_inventory_peaks_per_part(deliveries_2, pack_size, cons_2, shift_2_hours, max_lineside_2, min_lineside_2, remaining_on_hand)
 
-        for i, inv_units in enumerate(timeline_1):
-            space_records.append({
-                'Part Number': part,
-                'Shift': 1,
-                'Delivery Label': f"Delivery {i+1} (S1 - {time_1[i].strftime('%I:%M %p')})",
-                'Inventory Packages': inv_units // pack_size,
-                'Package Type': pkg_type
-            })
-
-        for i, inv_units in enumerate(timeline_2):
-            space_records.append({
-                'Part Number': part,
-                'Shift': 2,
-                'Delivery Label': f"Delivery {i+1} (S2 - {time_2[i].strftime('%I:%M %p')})",
-                'Inventory Packages': inv_units // pack_size,
-                'Package Type': pkg_type
-            })
+        for i, inv in enumerate(timeline_1):
+            space_records.append({'Part Number': part, 'Shift': 1, 'Delivery Label': f"Delivery {i+1} (S1 - {time_1[i].strftime('%I:%M %p')})", 'Inventory Packages': inv, 'Package Type': pkg_type})
+        for i, inv in enumerate(timeline_2):
+            space_records.append({'Part Number': part, 'Shift': 2, 'Delivery Label': f"Delivery {i+1} (S2 - {time_2[i].strftime('%I:%M %p')})", 'Inventory Packages': inv, 'Package Type': pkg_type})
 
     df_space = pd.DataFrame(space_records)
 
-    # === Format flat dock inventory table ===
+    # Pivot table to get final dock space report
     flat_records = []
     part_order = df_bom['Part Number'].tolist()
 
@@ -258,19 +243,26 @@ def run_analysis(uploaded_file):
     df_dock_space.loc[len(df_dock_space)] = row_util_pallet
     df_dock_space.loc[len(df_dock_space)] = total_lanes_needed
     df_dock_space.loc[len(df_dock_space)] = percent_lanes
+
+
+
     return df_output, df_dock_space
 
 # Streamlit interface
 st.title("Inbound Delivery Planning Tool")
+
+valid_names = ['Proteus', 'Hercules', 'Megasus'] 
+st.write("Make sure you have sheets titled 'Inbound-Proteus', 'Inbound-Hercules', or 'Inbound-Megasus' in your Excel file.")
+user_input = st.selectbox("Select the Drive Unit", valid_names)
 
 uploaded_file = st.file_uploader("Upload your BOM Excel file", type=["xlsx", "xlsm"])
 if uploaded_file:
     st.success("File uploaded successfully.")
     if st.button("Generate Delivery Plan"):
         with st.spinner("Processing..."):
-            df_output, df_dock_space = run_analysis(uploaded_file)
+            df_output, df_dock_space = run_analysis(uploaded_file, user_input)
 
-        st.subheader("Delivery Plan Output")
+        st.subheader(f"Delivery Plan Output for {user_input}")
 
         st.dataframe(df_output)
         st.subheader("Dock Inventory Space Per Part (Pallet Equivalents)")
@@ -280,5 +272,5 @@ if uploaded_file:
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_output.to_excel(writer, sheet_name="Delivery Plan", index=False)
             df_dock_space.to_excel(writer, sheet_name="Dock Inventory Space", index=False)
-        st.download_button("Download Excel", output.getvalue(), file_name="Delivery_Plan.xlsx")
+        st.download_button("Download Excel", output.getvalue(), file_name=f"Delivery_Plan_{user_input}.xlsx")
         
