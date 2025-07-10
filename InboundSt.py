@@ -10,6 +10,7 @@ from openpyxl import load_workbook
 import matplotlib.pyplot as plt
 import io
 import tempfile
+from openpyxl.styles import PatternFill
 
 
 def generate_times(start, end, cadence):
@@ -18,34 +19,59 @@ def generate_times(start, end, cadence):
     interval = (end - start) / cadence
     return [start + i * interval for i in range(cadence)]
 
-def generate_deliveries(qty, pack_size, cadence, shft_hrs, cons_rate):
+def generate_deliveries(qty, pack_size, cadence, shft_hrs, cons_rate, on_hand=0):
     if cadence == 0 or cadence is None:
         return []
+
     deliveries = []
     interval = shft_hrs / cadence
-    total_units_delivered = 0
-    total_units_needed = qty
+    total_needed_units = qty
+    total_delivered_units = 0
+    available_on_hand = on_hand
 
     for i in range(cadence):
-        units_needed = cons_rate * interval
-        remaining_units = total_units_needed - total_units_delivered
-        units_to_deliver = min(math.ceil(units_needed), remaining_units)
-        packages = math.ceil(units_to_deliver / pack_size)
+        remaining_units = max(total_needed_units - total_delivered_units, 0)
+        if remaining_units == 0:
+            deliveries.append(0)
+            continue
+
+        interval_consumption = cons_rate * interval
+
+        # How much is already on hand to cover consumption?
+        if available_on_hand >= interval_consumption:
+            available_on_hand -= interval_consumption
+            deliveries.append(0)
+            continue
+
+        shortfall_units = interval_consumption - available_on_hand
+
+        # Only deliver what remains needed
+        deliver_units = min(shortfall_units, remaining_units)
+
+        # Convert to packages (round up), but cap at remaining_units
+        packages = math.ceil(deliver_units / pack_size)
+        delivered_units = packages * pack_size
+
+        if delivered_units > remaining_units:
+            # Adjust down if over
+            delivered_units = remaining_units
+            packages = math.ceil(delivered_units / pack_size)
+
+        total_delivered_units += delivered_units
+        available_on_hand += delivered_units - interval_consumption
+
         deliveries.append(packages)
-        total_units_delivered += packages * pack_size
-        if total_units_delivered >= total_units_needed:
-            break
-    while len(deliveries) < cadence:
-        deliveries.append(0)
+
     return deliveries
 
-def get_dock_inventory_peaks_per_part(deliveries, pack_size, consumption_rate, shift_hours, max_lineside, min_lineside, on_hand):
+def get_dock_inventory_peaks_per_part(deliveries, pack_size, consumption_rate, shift_hours, on_hand_dock, on_hand_lineside):
     if not deliveries or pack_size <= 0 or consumption_rate <= 0:
         return [0] * len(deliveries)
 
     interval = shift_hours / len(deliveries)
-    dock_inventory_units = on_hand
-    lineside_inventory_units = 0
+    dock_inventory_units = on_hand_dock
+    lineside_inventory_units = on_hand_lineside
+
     dock_timeline = []
 
     for delivery in deliveries:
@@ -61,24 +87,36 @@ def get_dock_inventory_peaks_per_part(deliveries, pack_size, consumption_rate, s
         lineside_inventory_units += actual_pull
         lineside_inventory_units = max(0, lineside_inventory_units - consumption)
 
-    return dock_timeline
+    return dock_timeline, lineside_inventory_units
 
+# === Core Processing Logic ===
 
-def run_analysis(uploaded_file, input):
+def run_analysis(uploaded_file, input_drive_unit):
     wb = load_workbook(uploaded_file, data_only=True)
-    sheet_name = f'Inbound-{input}'
+    sheet_name = f'Inbound-{input_drive_unit}'
     ws = wb[sheet_name]
-    
-    # Read parameters 
+
+    # Determining lane material based on drive unit 
+    if input_drive_unit == 'Hercules':
+        side_lane = [
+        "600-01361", "400-01256", "400-01259", "400-01260-C2",
+        "600-01051", "600-01248", "600-02000", "600-02018", "600-00986"
+        ] 
+
+        lane = [
+        "400-01318", "400-01950", "600-01020", "600-01035",
+        "600-02306", "400-01226-C2", "400-01227-C2"
+        ]
+
+
+    # Read Parameters 
     cadence_shift_1 = ws['B5'].value
     cadence_shift_2 = ws['B13'].value
-    rate_per_line = ws['B6'].value
     lines_shift_1 = ws['B9'].value
     lines_shift_2 = ws['B10'].value
-    pallet_dock_space = ws['B2'].value
-    box_dock_space = ws['B3'].value
-    total_line_side = ws['F6'].value
-    pallets_per_line = ws['F7'].value
+    box_dock_space = ws['D2'].value
+    pallet_per_lane = ws['D3'].value
+    side_lane_pallet = ws['D4'].value
 
     start_shift_1 = datetime.strptime("6:15", "%H:%M")
     end_shift_1 = datetime.strptime("15:00", "%H:%M")
@@ -90,8 +128,7 @@ def run_analysis(uploaded_file, input):
     time_1 = generate_times(start_shift_1, end_shift_1, cadence_shift_1)
     time_2 = generate_times(start_shift_2, end_shift_2, cadence_shift_2)
 
-    df_bom_sheet = f'Inbound-{input}'
-    df_bom = pd.read_excel(uploaded_file, sheet_name= df_bom_sheet, skiprows=15, header=None)
+    df_bom = pd.read_excel(uploaded_file, sheet_name=sheet_name, skiprows=15, header=None)
     df_bom.columns = [
         'Part Number', 'Description', 'Quantity / Unit', 'Needed per day',
         'Quantity Needed for Shift 1', 'Quantity Needed for Shift 2',
@@ -99,70 +136,78 @@ def run_analysis(uploaded_file, input):
         'Consumption Rate Units/ Hour Shift 1',
         'Consumption Rate / Hour Shift 2', 'Standard Pack Size', 'Package Type',
         'Maximum Storage on Lineside', 'Minimum Storage on Lineside', 
-        'On-hand qty', 'QTY vs Shift 1']
+        'On-hand qty', 'QTY vs Shift 1', 'On-hand on dock'
+    ]
 
-    columns = ['Part Number', 'Package Type']
+    columns = ['Part Number', 'Package Type', 'Description']
     columns += [f"Delivery {i+1} (S1 - {t.strftime('%I:%M %p')})" for i, t in enumerate(time_1)]
     columns += [f"Delivery {i+1} (S2 - {t.strftime('%I:%M %p')})" for i, t in enumerate(time_2)]
 
     delivery_plan = []
 
-    for i, row in df_bom.iterrows():
+    for _, row in df_bom.iterrows():
         part = row['Part Number']
         pkg_type = row['Package Type']
         pack_size = row['Standard Pack Size']
+        descrip = row['Description']
         qty1 = row['Quantity Needed for Shift 1']
         qty2 = row['Quantity Needed for Shift 2']
         cons_1 = row['Consumption Rate Units/ Hour Shift 1']
         cons_2 = row['Consumption Rate / Hour Shift 2']
         on_hand = row['On-hand qty'] 
 
-        net_qty_1 = max(qty1 - on_hand, 0)
+        net_qty1 = max(qty1 - on_hand, 0)
         remaining_on_hand = max(on_hand - qty1, 0)
-        net_qty_2 = max(qty2 - remaining_on_hand, 0)
+        net_qty2 = max(qty2 - remaining_on_hand, 0)
 
-        deliveries_1 = generate_deliveries(net_qty_1, pack_size, cadence_shift_1, shift_1_hours, cons_1)
-        deliveries_2 = generate_deliveries(net_qty_2, pack_size, cadence_shift_2, shift_2_hours, cons_2)
+        deliveries_1 = generate_deliveries(net_qty1, pack_size, cadence_shift_1, shift_1_hours, cons_1, on_hand)
+        deliveries_2 = generate_deliveries(net_qty2, pack_size, cadence_shift_2, shift_2_hours, cons_2, remaining_on_hand)
 
-        delivery_plan.append([part, pkg_type] + deliveries_1 + deliveries_2)
+        delivery_plan.append([part, pkg_type, descrip] + deliveries_1 + deliveries_2)
 
     df_output = pd.DataFrame(delivery_plan, columns=columns)
 
+    # Caculate Total Number of Boxes and Pallets 
     df_boxes = df_output[df_output['Package Type'] == 'Box']
     df_pallets = df_output[df_output['Package Type'] == 'Pallet']
 
-    box_total = ['TOTAL - BOX', 'Box'] + list(df_boxes.iloc[:, 2:].sum())
-    pallet_total = ['TOTAL - PALLET', 'Pallet'] + list(df_pallets.iloc[:, 2:].sum())
-    box_sums = df_boxes.iloc[:, 2:].sum()
-    pallet_sums = df_pallets.iloc[:, 2:].sum()
-
-    # Compute space utilization 
-    utilization_pallet = ['Space Utilization Pallet', '']
-    utilization_box = ['Space Utilization Box', '']
-    total_lanes_needed = ['Lanes Utilized', '']
-    percent_lanes = ['Percent of Lanes Utilized', '']
-    for box, pallet in zip(box_sums, pallet_sums):
-        percent_box = (box / box_dock_space) * 100 if box_dock_space else 0
-        percent_pallet = (pallet / pallet_dock_space) * 100 if pallet_dock_space else 0
-
-        lanes_used = math.ceil(pallet/ pallets_per_line) 
-        lanes_percent = 100*lanes_used / total_line_side 
-
-        utilization_pallet.append(round(percent_pallet, 1))
-        utilization_box.append(round(percent_box, 1))
-
-        total_lanes_needed.append(lanes_used)
-        percent_lanes.append(round(lanes_percent,1))
-
+    box_total = ['TOTAL - BOX', 'Box', ''] + list(df_boxes.iloc[:, 3:].sum())
+    pallet_total = ['TOTAL - PALLET', 'Pallet', ''] + list(df_pallets.iloc[:, 3:].sum())
+    box_sums = df_boxes.iloc[:, 3:].sum()
+    pallet_sums = df_pallets.iloc[:, 3:].sum()
+    df_output.loc[len(df_output)] = pd.Series(dtype=object)
     df_output.loc[len(df_output)] = box_total
     df_output.loc[len(df_output)] = pallet_total
-    df_output.loc[len(df_output)] = utilization_box
-    df_output.loc[len(df_output)] = utilization_pallet
-    df_output.loc[len(df_output)] = total_lanes_needed
-    df_output.loc[len(df_output)] = percent_lanes
 
-    #=============================================================================================
+    # Calculate Rack Percent Usage 
+    box_percent_usage = ['Box % Usage', 'Box', ''] + list(((box_sums / box_dock_space)*100).round(2))
+    df_output.loc[len(df_output)] = pd.Series(dtype=object)
+    df_output.loc[len(df_output)] = box_percent_usage
 
+    # Calculate Side Pallet Space Utilization 
+    side_df = df_output[df_output['Part Number'].isin(side_lane)]
+    side_usage_total = ['TOTAL - SIDE LANE', '', ''] + list(side_df.iloc[:, 3:].sum())
+    df_output.loc[len(df_output)] = side_usage_total
+
+    side_pallet_usage = ['SIDE LANE % Usage', '', ''] + list(((side_df.iloc[:, 3:].sum() / side_lane_pallet) * 100).round(2))
+    df_output.loc[len(df_output)] = side_pallet_usage
+    df_output.loc[len(df_output)] = pd.Series(dtype=object)
+
+    # Calculate lane percent Usage for each Lane material 
+    lane_df = df_output[df_output['Part Number'].isin(lane)].copy()
+    for idx, row in lane_df.iterrows():
+        part = row['Part Number']
+        pkg_type = row['Package Type']
+        desc = row['Description']
+
+        deliveries = row.iloc[3:]  
+        usage_pct = (deliveries / pallet_per_lane) * 100
+
+        label = f"LANE % - {part}"
+        new_row = [label, pkg_type, desc] + list(usage_pct)
+        df_output.loc[len(df_output)] = new_row
+    
+    # Dock Inventory Analysis
     space_records = []
 
     for idx, row in df_bom.iterrows():
@@ -171,19 +216,15 @@ def run_analysis(uploaded_file, input):
         pkg_type = row['Package Type']
         cons_1 = row['Consumption Rate Units/ Hour Shift 1'] * 0.9
         cons_2 = row['Consumption Rate / Hour Shift 2'] * 0.9
+        on_hand_on_dock = row['On-hand on dock']
         on_hand = row['On-hand qty']
-        remaining_on_hand = max(on_hand - row['Quantity Needed for Shift 1'], 0)
+        remaining_on_hand = max(on_hand_on_dock - row['Quantity Needed for Shift 1'], 0)
 
         deliveries_1 = df_output.loc[idx, df_output.columns.str.contains(r"S1 -")].tolist()
         deliveries_2 = df_output.loc[idx, df_output.columns.str.contains(r"S2 -")].tolist()
 
-        max_lineside_1 = lines_shift_1 * row['Maximum Storage on Lineside']
-        min_lineside_1 = lines_shift_1 * row['Minimum Storage on Lineside']
-        max_lineside_2 = lines_shift_2 * row['Maximum Storage on Lineside']
-        min_lineside_2 = lines_shift_2 * row['Minimum Storage on Lineside']
-
-        timeline_1 = get_dock_inventory_peaks_per_part(deliveries_1, pack_size, cons_1, shift_1_hours, max_lineside_1, min_lineside_1, on_hand)
-        timeline_2 = get_dock_inventory_peaks_per_part(deliveries_2, pack_size, cons_2, shift_2_hours, max_lineside_2, min_lineside_2, remaining_on_hand)
+        timeline_1, lineside2 = get_dock_inventory_peaks_per_part(deliveries_1, pack_size, cons_1, shift_1_hours, on_hand_on_dock, on_hand - on_hand_on_dock)
+        timeline_2, _ = get_dock_inventory_peaks_per_part(deliveries_2, pack_size, cons_2, shift_2_hours, remaining_on_hand, lineside2)
 
         for i, inv in enumerate(timeline_1):
             space_records.append({'Part Number': part, 'Shift': 1, 'Delivery Label': f"Delivery {i+1} (S1 - {time_1[i].strftime('%I:%M %p')})", 'Inventory Packages': inv, 'Package Type': pkg_type})
@@ -201,68 +242,127 @@ def run_analysis(uploaded_file, input):
         if part_rows.empty:
             continue
         pkg_type = part_rows['Package Type'].iloc[0]
-        row = {'Part #': part, 'TYPE': pkg_type}
+        row = {'Part Number': part, 'Package Type': pkg_type, 'Description':df_bom[df_bom['Part Number'] == part]['Description'].iloc[0]}
         for _, rec in part_rows.iterrows():
             row[rec['Delivery Label']] = rec['Inventory Packages']
         flat_records.append(row)
 
     df_dock_space = pd.DataFrame(flat_records).fillna(0)
 
-    # === Totals and utilization ===
-    delivery_headers = [col for col in df_dock_space.columns if col.startswith('Delivery')]
-    df_boxes = df_dock_space[df_dock_space['TYPE'] == 'Box']
-    df_pallets = df_dock_space[df_dock_space['TYPE'] == 'Pallet']
 
-    row_total_box = ['Total BOXES', ''] + list(df_boxes[delivery_headers].sum().values)
-    row_total_pallet = ['Total PALLETS', ''] + list(df_pallets[delivery_headers].sum().values)
-    row_util_pallet = ['Percent Utilization Pallet', '']
-    row_util_box = ['Percent Utilization Box', '']
-    total_lanes_needed = ['Lanes Utilized', '']
-    percent_lanes = ['Percent of Lanes Utilized', '']
+    df_boxes = df_dock_space[df_dock_space['Package Type'] == 'Box']
+    df_pallets = df_dock_space[df_dock_space['Package Type'] == 'Pallet']
 
-    box_sums = df_boxes[delivery_headers].sum()
-    pallet_sums = df_pallets[delivery_headers].sum()
+    box_total = ['TOTAL - BOX', 'Box', ''] + list(df_boxes.iloc[:, 3:].sum())
+    pallet_total = ['TOTAL - PALLET', 'Pallet', ''] + list(df_pallets.iloc[:, 3:].sum())
+    box_sums = df_boxes.iloc[:, 3:].sum()
+    pallet_sums = df_pallets.iloc[:, 3:].sum()
+    df_dock_space.loc[len(df_dock_space)] = pd.Series(dtype=object)
+    df_dock_space.loc[len(df_dock_space)] = box_total
+    df_dock_space.loc[len(df_dock_space)] = pallet_total
 
-    for col in delivery_headers:
-        box_count = box_sums[col]
-        pallet_count = pallet_sums[col]
+    # Calculate Rack Percent Usage 
+    box_percent_usage = ['Box % Usage', 'Box', ''] + list(((box_sums / box_dock_space)*100).round(2))
+    df_dock_space.loc[len(df_dock_space)] = pd.Series(dtype=object)
+    df_dock_space.loc[len(df_dock_space)] = box_percent_usage
 
-        percent_pallet = (pallet_count / pallet_dock_space) * 100 if pallet_dock_space else 0
-        percent_box = (box_count / box_dock_space) * 100 if box_dock_space else 0
-        row_util_pallet.append(round(percent_pallet, 1))
-        row_util_box.append(round(percent_box, 1))
-        
-        lanes_used = math.ceil(pallet_count / pallets_per_line)
-        lanes_percent = 100 * lanes_used / total_line_side
-        total_lanes_needed.append(lanes_used)
-        percent_lanes.append(round(lanes_percent, 1))
+    # Calculate Side Pallet Space Utilization 
+    side_df = df_dock_space[df_dock_space['Part Number'].isin(side_lane)]
+    side_usage_total = ['TOTAL - SIDE LANE', '', ''] + list(side_df.iloc[:, 3:].sum())
 
-    df_dock_space.loc[len(df_dock_space)] = row_total_box
-    df_dock_space.loc[len(df_dock_space)] = row_total_pallet
-    df_dock_space.loc[len(df_dock_space)] = row_util_box
-    df_dock_space.loc[len(df_dock_space)] = row_util_pallet
-    df_dock_space.loc[len(df_dock_space)] = total_lanes_needed
-    df_dock_space.loc[len(df_dock_space)] = percent_lanes
+    df_dock_space.loc[len(df_dock_space)] = side_usage_total
 
+    side_pallet_usage = ['SIDE LANE % Usage', '', ''] + list(((side_df.iloc[:, 3:].sum() / side_lane_pallet) * 100).round(2))
+    df_dock_space.loc[len(df_dock_space)] = side_pallet_usage
+    df_dock_space.loc[len(df_dock_space)] = pd.Series(dtype=object)
 
+    # Calculate lane percent Usage for each Lane material 
+    lane_df = df_dock_space[df_dock_space['Part Number'].isin(lane)].copy()
+    for idx, row in lane_df.iterrows():
+        part = row['Part Number']
+        pkg_type = row['Package Type']
+        desc = row['Description']
 
-    return df_output, df_dock_space
+        timeline = row.iloc[3:]  # Get delivery columns
+        usage_pct = (timeline / pallet_per_lane) * 100
 
-# Streamlit interface
+        label = f"LANE % - {part}"
+        new_row = [label, pkg_type, desc] + list(usage_pct)
+        df_dock_space.loc[len(df_dock_space)] = new_row
+
+    return df_output, df_dock_space, side_lane, lane
+
+# Color Key 
+def add_color_key_to_side(ws):
+    sand_fill = PatternFill(start_color="F4E1C1", end_color="F4E1C1", fill_type="solid")
+    sand_blue_fill = PatternFill(start_color="B0C4DE", end_color="B0C4DE", fill_type="solid")
+    sand_green_fill = PatternFill(start_color="C1D1C1", end_color="C1D1C1", fill_type="solid")
+    sand_gray_fill = PatternFill(start_color="C0C0C0", end_color="C0C0C0", fill_type="solid")
+
+    legend_items = [
+        ("Side Lane Part / Usage", sand_fill),
+        ("Lane Part / Usage", sand_blue_fill),
+        ("Totals", sand_green_fill),
+        ("Racks", sand_gray_fill)
+    ]
+
+    # Find starting column (2 columns after last column of data)
+    start_col = ws.max_column + 2
+    start_row = 2  # You can change where vertically you want it
+
+    for i, (label, fill) in enumerate(legend_items):
+        cell_label = ws.cell(row=start_row + i, column=start_col, value=label)
+        cell_color = ws.cell(row=start_row + i, column=start_col + 1)
+        cell_color.fill = fill
+
+#   Styling Helper Functions 
+def highlight_side_lane_ws(ws, side_lane, lane):
+    sand_fill = PatternFill(start_color="F4E1C1", end_color="F4E1C1", fill_type="solid")
+    sand_blue_fill = PatternFill(start_color="B0C4DE", end_color="B0C4DE", fill_type="solid")
+    sand_green_fill = PatternFill(start_color="C1D1C1", end_color="C1D1C1", fill_type="solid")
+    sand_gray_fill = PatternFill(start_color="C0C0C0", end_color="C0C0C0", fill_type="solid")
+
+    header = [cell.value for cell in ws[1]]
+    part_num_col_idx = header.index("Part Number") + 1
+    pkg_type_col_idx = header.index("Package Type") + 1
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        part_value = str(row[part_num_col_idx - 1].value).strip()
+        pkg_type_value = str(row[pkg_type_col_idx - 1].value).strip()
+
+        if part_value in side_lane or "SIDE LANE % Usage" in part_value or "TOTAL - SIDE LANE" in part_value:
+            fill = sand_fill
+        elif part_value in lane or part_value.startswith("LANE % -"):
+            fill = sand_blue_fill
+        elif "TOTAL - BOX" in part_value or "TOTAL - PALLET" in part_value:
+            fill = sand_green_fill
+        elif pkg_type_value == "Box":
+            fill = sand_gray_fill
+        else:
+            fill = None
+
+        if fill:
+            for cell in row:
+                cell.fill = fill
+
+    add_color_key_to_side(ws)
+    
+   # Streamlit interface
 st.title("Inbound Delivery Planning Tool")
 
 valid_names = ['Proteus', 'Hercules', 'Megasus'] 
 st.write("Make sure you have sheets titled 'Inbound-Proteus', 'Inbound-Hercules', or 'Inbound-Megasus' in your Excel file.")
-user_input = st.selectbox("Select the Drive Unit", valid_names)
+input_drive_unit = st.selectbox("Select the Drive Unit", valid_names)
 
 uploaded_file = st.file_uploader("Upload your BOM Excel file", type=["xlsx", "xlsm"])
 if uploaded_file:
     st.success("File uploaded successfully.")
     if st.button("Generate Delivery Plan"):
         with st.spinner("Processing..."):
-            df_output, df_dock_space = run_analysis(uploaded_file, user_input)
+             df_output, df_dock_space, side_lane, lane = run_analysis(uploaded_file, input_drive_unit)
 
-        st.subheader(f"Delivery Plan Output for {user_input}")
+
+        st.subheader(f"Delivery Plan Output for {input_drive_unit}")
 
         st.dataframe(df_output)
         st.subheader("Dock Inventory Space Per Part (Pallet Equivalents)")
@@ -272,5 +372,19 @@ if uploaded_file:
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_output.to_excel(writer, sheet_name="Delivery Plan", index=False)
             df_dock_space.to_excel(writer, sheet_name="Dock Inventory Space", index=False)
-        st.download_button("Download Excel", output.getvalue(), file_name=f"Delivery_Plan_{user_input}.xlsx")
-        
+            workbook = writer.book
+            ws1 = workbook["Delivery Plan"]
+            ws2 = workbook["Dock Inventory Space"]
+
+            # Highlight in-memory worksheets
+            highlight_side_lane_ws(ws1, side_lane, lane)
+            highlight_side_lane_ws(ws2, side_lane, lane)
+
+        output.seek(0)
+        st.download_button(
+            "Download Excel",
+            output,
+            file_name=f"Delivery_Plan_{input_drive_unit}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        st.write("Download Excel File for data to be color coded")
